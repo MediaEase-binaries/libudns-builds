@@ -1,0 +1,179 @@
+name: Build libudns
+
+permissions: write-all
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'libudns version to build'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - 'all'
+          - '0.4.0'
+          - '0.5.0'
+          - '0.6.0'
+
+jobs:
+  build:
+    name: Build libudns
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        version: ['0.4.0', '0.5.0', '0.6.0']
+        ipv6: ["ON", "OFF"]
+
+    steps:
+      - name: Pre-check
+        id: pre-check
+        run: |
+          if gh release view "v${{ matrix.version }}" &>/dev/null; then
+            echo "Version ${{ matrix.version }} already has a release, skipping"
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          else
+            echo "Version ${{ matrix.version }} needs to be built"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout repository
+        if: steps.pre-check.outputs.should_build == 'true'
+        uses: actions/checkout@v4
+
+      - name: Checkout tools repository
+        if: steps.pre-check.outputs.should_build == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: MediaEase-binaries/tools
+          token: ${{ secrets.ORG_WORKFLOW }}
+          path: tools
+
+      - name: Setup common scripts
+        if: steps.pre-check.outputs.should_build == 'true'
+        id: setup
+        run: |
+          chmod +x tools/*.sh
+          echo "build_script=tools/packages/libudns/build.sh" >> $GITHUB_OUTPUT
+
+      - name: Build libudns
+        if: steps.pre-check.outputs.should_build == 'true'
+        run: |
+          chmod +x ${{ steps.setup.outputs.build_script }}
+          flag=$([ "${{ matrix.ipv6 }}" == "ON" ] && echo "--enable-ipv6" || echo "--disable-ipv6")
+          ./${{ steps.setup.outputs.build_script }} ${{ matrix.version }} $flag
+
+      - name: Create Debian package
+        if: steps.pre-check.outputs.should_build == 'true'
+        run: |
+          PKG_DIR="package_libudns"
+          mkdir -p "$PKG_DIR/DEBIAN" "$PKG_DIR/usr"
+          cp -r custom_build/install/usr/* "$PKG_DIR/usr/"
+          installed_size=$(du -s -k "$PKG_DIR" | cut -f1)
+          cat > "$PKG_DIR/DEBIAN/control" <<EOF
+          Package: libudns
+          Version: ${{ matrix.version }}-ipv6-${{ matrix.ipv6 }}-1build1
+          Architecture: amd64
+          Maintainer: Thomas Chauveau <contact.tomc@yahoo.com>
+          Installed-Size: $installed_size
+          Depends: libc6
+          Section: net
+          Priority: optional
+          Homepage: https://libudns.sourceforge.io/
+          Description: Lightweight DNS resolution library
+            libudns is a lightweight, portable, and efficient library for DNS resolution.
+            .
+            Version: ${{ matrix.version }} (IPv6: ${{ matrix.ipv6 }})
+            .
+            Compiled on $(date +%Y-%m-%d).
+          EOF
+          cd "$PKG_DIR"
+          find usr -type f -exec md5sum {} \; > DEBIAN/md5sums
+          cd ..
+          dpkg-deb --build -Zxz -z9 -Sextreme "$PKG_DIR" "libudns_${{ matrix.version }}-ipv6-${{ matrix.ipv6 }}-1build1_amd64.deb"
+          mkdir -p artifacts
+          mv *.deb artifacts/
+          cd artifacts
+          deb_file="libudns_${{ matrix.version }}-ipv6-${{ matrix.ipv6 }}-1build1_amd64.deb"
+          echo "Generating metadata for DEB file: $deb_file"
+          ../tools/generate_metadata.sh \
+            --category "libudns" \
+            --tag "ipv6-${{ matrix.ipv6 }}" \
+            --version "${{ matrix.version }}" \
+            --extra "ipv6=${{ matrix.ipv6 }}" \
+            "$deb_file"
+          ls -l "$(basename "$deb_file" .deb).json"
+
+      - name: Upload as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libudns-${{ matrix.version }}-ipv6-${{ matrix.ipv6 }}
+          path: artifacts/*
+          retention-days: 7
+
+  release:
+    name: Create Releases
+    needs: build
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        version: ['0.4.0', '0.5.0', '0.6.0']
+      fail-fast: false
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Download artifacts for this version
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded_artifacts
+          pattern: libudns-${{ matrix.version }}-ipv6-*
+      
+      - name: Prepare release assets
+        id: prepare-release-assets
+        run: |
+          mkdir -p release_assets
+          TOTAL_FILES=$(find downloaded_artifacts -name "libudns_${{ matrix.version }}*" | wc -l)
+          DEB_FILES=$(find downloaded_artifacts -name "libudns_${{ matrix.version }}*.deb" | wc -l)
+          JSON_FILES=$(find downloaded_artifacts -name "libudns_${{ matrix.version }}*.json" | wc -l)
+          echo "Found $TOTAL_FILES total files for version ${{ matrix.version }}"
+          echo "  - $DEB_FILES .deb files"
+          echo "  - $JSON_FILES .json files"
+          echo "skip_release=false" >> $GITHUB_OUTPUT
+          if [ "$TOTAL_FILES" -ne 4 ] || [ "$DEB_FILES" -ne 2 ] || [ "$JSON_FILES" -ne 2 ]; then
+            echo "skip_release=true" >> $GITHUB_OUTPUT
+          fi
+          find downloaded_artifacts -name "libudns_${{ matrix.version }}*.deb" -exec cp {} release_assets/ \;
+          find downloaded_artifacts -name "libudns_${{ matrix.version }}*.json" -exec cp {} release_assets/ \;
+          echo "Files for release v${{ matrix.version }}:"
+          ls -la release_assets/
+      
+      - name: Create Release
+        if: steps.prepare-release-assets.outputs.skip_release == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ matrix.version }}
+          name: libudns ${{ matrix.version }}
+          files: |
+            release_assets/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ## libudns ${{ matrix.version }}
+            
+            Release includes multiple build variants:
+            
+            - With IPv6 support
+            - Without IPv6 support
+            
+            Choose the package that matches your needs.
+            
+            Each package is accompanied by its JSON metadata file for automated installations.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
